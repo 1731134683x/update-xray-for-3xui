@@ -191,16 +191,23 @@ systemctl status xray
 
 ## 查看当前版本
 
+3x-ui 通常使用带架构后缀的 Xray 文件。AMD64 系统可以执行：
+
 ```bash
-/usr/local/x-ui/bin/xray version
+/usr/local/x-ui/bin/xray-linux-amd64 -version
 ```
 
-如果当前版本使用另一种参数格式，可以尝试：
+也可以检查通用文件：
 
 ```bash
 /usr/local/x-ui/bin/xray -version
 ```
 
+为了防止异常二进制卡住，可以加上超时：
+
+```bash
+timeout 10s /usr/local/x-ui/bin/xray-linux-amd64 -version
+```
 ## 常见问题
 
 ### 1. 提示目标目录不存在
@@ -245,6 +252,20 @@ journalctl -u xray -n 100 --no-pager
 
 脚本会显示当前版本和远程版本，然后正常退出，不会下载文件、安装 `unzip` 或重启服务。
 
+### 6. 停在“正在测试新 xray 是否可运行”
+
+旧版脚本先执行了 `xray version`，某些版本可能不会立即返回。新版已经改为官方参数 `xray -version`，并增加 10 秒超时保护。
+
+如果旧脚本仍卡住，可以按 `Ctrl+C` 停止，然后更新脚本并重新运行。新版还会优先检测 3x-ui 常见的 `xray-linux-amd64`、`xray-linux-arm64` 或 `xray-linux-armv7` 文件。
+
+可以手动测试：
+
+```bash
+timeout 10s /usr/local/x-ui/bin/xray-linux-amd64 -version
+echo $?
+```
+
+返回 `124` 表示命令超时；正常情况下会直接显示 Xray 版本。
 ## 安全提示
 
 - 本脚本更新的是 **Pre-release（预发布）版本**，可能存在尚未完全验证的问题。

@@ -12,7 +12,8 @@ YELLOW="\033[33m"
 NC="\033[0m"
 
 TARGET_DIR="/usr/local/x-ui/bin"
-XRAY_BIN="${TARGET_DIR}/xray"
+XRAY_BIN=""
+VERSION_TIMEOUT=10
 SERVICE_NAME=""
 APT_UPDATED=0
 
@@ -83,6 +84,38 @@ normalize_version() {
     echo "$1" | sed 's/^v//'
 }
 
+
+detect_xray_binary() {
+    local candidate
+    # 3x-ui 通常实际调用带架构后缀的文件，因此优先检测它。
+    local candidates=(
+        "${TARGET_DIR}/xray-linux-${BIN_ARCH}"
+        "${TARGET_DIR}/xray"
+    )
+
+    for candidate in "${candidates[@]}"; do
+        if [ -x "${candidate}" ]; then
+            XRAY_BIN="${candidate}"
+            ok "检测到当前 xray 文件: ${XRAY_BIN}"
+            return 0
+        fi
+    done
+
+    XRAY_BIN="${TARGET_DIR}/xray"
+    warn "未找到已安装的 xray 可执行文件"
+}
+
+read_xray_version() {
+    local binary="$1"
+    local output
+
+    # Xray 官方 CLI 使用 -version。增加超时，防止异常二进制长时间卡住。
+    output="$(timeout -k 2s "${VERSION_TIMEOUT}s" "${binary}" -version 2>/dev/null)" || return $?
+
+    printf '%s\n' "${output}" \
+        | awk 'NR == 1 {gsub(/^v/, "", $2); print $2; exit}'
+}
+
 detect_service() {
     local candidates=("x-ui" "3x-ui" "xray")
 
@@ -115,7 +148,7 @@ detect_env() {
     . /etc/os-release
     [ "${ID:-}" = "ubuntu" ] || die "仅支持 Ubuntu，当前系统: ${PRETTY_NAME:-unknown}"
 
-    for cmd in apt-get dpkg-query systemctl uname mktemp install chmod cp mv sed grep awk head date mkdir rm; do
+    for cmd in apt-get dpkg-query systemctl uname mktemp install chmod cp mv sed grep awk head timeout date mkdir rm; do
         check_cmd "$cmd"
     done
 
@@ -141,6 +174,8 @@ detect_env() {
     esac
 
     ok "架构检测通过: ${ARCH}，下载标识: ${DL_ARCH}，安装标识: ${BIN_ARCH}"
+
+    detect_xray_binary
 
     detect_service
 }
@@ -170,24 +205,13 @@ get_version() {
 # 3. 检测当前版本，版本一致则退出
 check_current_version() {
     if [ ! -x "${XRAY_BIN}" ]; then
-        warn "未找到当前 xray 可执行文件: ${XRAY_BIN}，将执行全新安装"
+        warn "未找到当前 xray 可执行文件，将执行全新安装"
         return 0
     fi
 
-    CURRENT_VER="$(
-        "${XRAY_BIN}" version 2>/dev/null \
-        | head -n 1 \
-        | awk '{print $2}' \
-        | sed 's/^v//'
-    )"
-
-    if [ -z "${CURRENT_VER}" ]; then
-        CURRENT_VER="$(
-            "${XRAY_BIN}" -version 2>/dev/null \
-            | head -n 1 \
-            | awk '{print $2}' \
-            | sed 's/^v//'
-        )"
+    if ! CURRENT_VER="$(read_xray_version "${XRAY_BIN}")"; then
+        warn "读取当前 xray 版本失败或超过 ${VERSION_TIMEOUT} 秒，将继续更新"
+        return 0
     fi
 
     if [ -z "${CURRENT_VER}" ]; then
@@ -246,26 +270,21 @@ download_and_verify() {
     unzip -oq "${ZIP_FILE}" xray -d "${TMP_DIR}" || die "解压 xray 失败"
 
     [ -f "${BIN_FILE}" ] || die "压缩包内未找到 xray 文件"
-
     chmod +x "${BIN_FILE}"
 
-    info "正在测试新 xray 是否可运行..."
-    if ! "${BIN_FILE}" version >/dev/null 2>&1 && ! "${BIN_FILE}" -version >/dev/null 2>&1; then
-        die "新 xray 二进制文件无法运行，可能与当前系统不兼容"
+    info "正在测试新 xray 是否可运行（最多 ${VERSION_TIMEOUT} 秒）..."
+
+    if ! NEW_BIN_VER="$(read_xray_version "${BIN_FILE}")"; then
+        die "新 xray 二进制文件执行失败或超过 ${VERSION_TIMEOUT} 秒，可能与当前系统不兼容"
     fi
 
-    NEW_BIN_VER="$(
-        "${BIN_FILE}" version 2>/dev/null \
-        | head -n 1 \
-        | awk '{print $2}' \
-        | sed 's/^v//'
-    )"
+    [ -n "${NEW_BIN_VER}" ] || die "无法识别新 xray 二进制文件的版本"
 
-    if [ -n "${NEW_BIN_VER}" ] && [ "${NEW_BIN_VER}" != "${REMOTE_VER}" ]; then
+    if [ "${NEW_BIN_VER}" != "${REMOTE_VER}" ]; then
         die "下载到的二进制版本异常，期望 ${REMOTE_VER}，实际 ${NEW_BIN_VER}"
     fi
 
-    ok "二进制文件执行测试通过"
+    ok "二进制文件执行测试通过: ${NEW_BIN_VER}"
 }
 
 # 5. 安装与重启
@@ -311,7 +330,7 @@ install_xray() {
 
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN} 更新成功！当前内核版本状态：${NC}"
-    "${TARGET_DIR}/xray" version 2>/dev/null | head -n 2 || "${TARGET_DIR}/xray" -version 2>/dev/null | head -n 2
+    timeout -k 2s "${VERSION_TIMEOUT}s" "${TARGET_DIR}/xray" -version 2>/dev/null | head -n 2 || true
     echo -e "${GREEN}========================================${NC}"
 }
 
