@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# update-xray-for-3xui — Xray-core Pre-release 自动更新脚本
+# update-xray-for-3xui — Xray-core 自动更新脚本（自动比较 Stable / Pre-release，选取最新）
 # GitHub: https://github.com/1731134683x/update-xray-for-3xui
 # 用法: sudo bash update-xray.sh
 # ============================================================
@@ -84,6 +84,16 @@ normalize_version() {
     echo "$1" | sed 's/^v//'
 }
 
+# 按版本号比较（入参为已去掉 v 前缀的版本号）：$1 比 $2 新时返回 0，相等或更旧返回非 0。
+# 使用 GNU sort -V 做数字分段比较，避免字符串比较把 26.10.21 判成比 26.9.30 旧。
+version_gt() {
+    if [ "$1" = "$2" ]; then
+        return 1
+    fi
+
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n 1)" = "$1" ]
+}
+
 
 detect_xray_binary() {
     local candidate
@@ -137,7 +147,7 @@ detect_service() {
     warn "未检测到 x-ui / 3x-ui / xray systemd 服务，更新完成后将跳过自动重启"
 }
 
-echo -e "${YELLOW}>>> 开始 Xray-core Pre-release 更新流程...${NC}"
+echo -e "${YELLOW}>>> 开始 Xray-core 更新流程（自动比较 Stable 与 Pre-release，选取最新版本）...${NC}"
 
 # 1. 基础环境检测（此阶段不执行 apt-get）
 detect_env() {
@@ -148,7 +158,7 @@ detect_env() {
     . /etc/os-release
     [ "${ID:-}" = "ubuntu" ] || die "仅支持 Ubuntu，当前系统: ${PRETTY_NAME:-unknown}"
 
-    for cmd in apt-get dpkg-query systemctl uname mktemp install chmod cp mv sed grep awk head timeout date mkdir rm; do
+    for cmd in apt-get dpkg-query systemctl uname mktemp install chmod cp mv sed grep awk head tail sort timeout date mkdir rm; do
         check_cmd "$cmd"
     done
 
@@ -180,26 +190,69 @@ detect_env() {
     detect_service
 }
 
-# 2. 获取最新 Pre-release 版本
+# 2. 获取最新版本：同时查询 Stable 与 Pre-release，按版本号比较后取较新的一方
 get_version() {
-    info "正在获取 Xray-core 最新 Pre-release 版本..."
+    local releases_json="${TMP_DIR}/releases.json"
 
-    XRAY_VER="$(
-        curl -fsSL \
-            --connect-timeout 15 \
-            --retry 5 \
-            --retry-delay 3 \
-            --retry-connrefused \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30" \
-        | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty'
-    )"
+    info "正在获取 Xray-core 最新 Stable / Pre-release 版本信息..."
 
-    [ -n "${XRAY_VER}" ] || die "无法获取最新 Pre-release 版本号，请检查 GitHub API 连通性"
+    curl -fsSL \
+        --connect-timeout 15 \
+        --retry 5 \
+        --retry-delay 3 \
+        --retry-connrefused \
+        -H "Accept: application/vnd.github+json" \
+        -o "${releases_json}" \
+        "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30" \
+        || die "无法获取 Xray-core 版本信息，请检查 GitHub API 连通性"
+
+    [ -s "${releases_json}" ] || die "GitHub API 返回内容为空，请稍后重试"
+
+    # 分别取出最新的正式版（Stable）与最新的预发布版（Pre-release）。
+    # GitHub 返回的 releases 列表按发布时间倒序，因此每组的第一条就是该组最新版本。
+    STABLE_TAG="$(jq -r '[.[] | select(.draft == false and .prerelease == false)][0].tag_name // empty' \
+        "${releases_json}")" || die "解析 Stable 版本信息失败，GitHub API 可能触发速率限制"
+
+    PRERELEASE_TAG="$(jq -r '[.[] | select(.draft == false and .prerelease == true)][0].tag_name // empty' \
+        "${releases_json}")" || die "解析 Pre-release 版本信息失败，GitHub API 可能触发速率限制"
+
+    STABLE_VER=""
+    PRERELEASE_VER=""
+    if [ -n "${STABLE_TAG}" ]; then
+        STABLE_VER="$(normalize_version "${STABLE_TAG}")"
+    fi
+    if [ -n "${PRERELEASE_TAG}" ]; then
+        PRERELEASE_VER="$(normalize_version "${PRERELEASE_TAG}")"
+    fi
+
+    [ -n "${STABLE_VER}" ] || [ -n "${PRERELEASE_VER}" ] \
+        || die "无法获取 Xray-core 版本号，GitHub API 可能触发速率限制，请稍后重试"
+
+    if [ -n "${STABLE_VER}" ] && [ -n "${PRERELEASE_VER}" ]; then
+        ok "Stable 版本: ${STABLE_VER}，Pre-release 版本: ${PRERELEASE_VER}"
+
+        # 版本号相同视为同一版本，优先使用正式版；否则直接取版本号更大的一方。
+        if [ "${STABLE_VER}" = "${PRERELEASE_VER}" ] \
+            || version_gt "${STABLE_VER}" "${PRERELEASE_VER}"; then
+            XRAY_VER="${STABLE_TAG}"
+            REMOTE_CHANNEL="Stable"
+        else
+            XRAY_VER="${PRERELEASE_TAG}"
+            REMOTE_CHANNEL="Pre-release"
+        fi
+    elif [ -n "${STABLE_VER}" ]; then
+        XRAY_VER="${STABLE_TAG}"
+        REMOTE_CHANNEL="Stable"
+        warn "未找到最新的 Pre-release 版本，仅使用 Stable 版本"
+    else
+        XRAY_VER="${PRERELEASE_TAG}"
+        REMOTE_CHANNEL="Pre-release"
+        warn "未找到最新的 Stable 版本，仅使用 Pre-release 版本"
+    fi
 
     REMOTE_VER="$(normalize_version "${XRAY_VER}")"
 
-    ok "获取到最新 Pre-release 版本: ${XRAY_VER}"
+    ok "选取最新版本: ${XRAY_VER}（${REMOTE_CHANNEL}）"
 }
 
 # 3. 检测当前版本，版本一致则退出
@@ -220,18 +273,29 @@ check_current_version() {
     fi
 
     ok "当前已安装版本: ${CURRENT_VER}"
-    ok "远程最新版本: ${REMOTE_VER}"
+    ok "远程最新版本: ${REMOTE_VER}（${REMOTE_CHANNEL}）"
 
     if [ "${CURRENT_VER}" = "${REMOTE_VER}" ]; then
         echo -e "${GREEN}========================================${NC}"
         echo -e "${GREEN}[√] 当前已是最新版本，无需更新${NC}"
         echo -e "${GREEN}当前版本: ${CURRENT_VER}${NC}"
-        echo -e "${GREEN}远程版本: ${REMOTE_VER}${NC}"
+        echo -e "${GREEN}远程版本: ${REMOTE_VER}（${REMOTE_CHANNEL}）${NC}"
         echo -e "${GREEN}========================================${NC}"
         exit 0
     fi
 
-    info "发现新版本，将从 ${CURRENT_VER} 更新到 ${REMOTE_VER}"
+    # 防止降级：当前版本比远程最新版本还新（例如手动安装的开发版）时保持现状。
+    if version_gt "${CURRENT_VER}" "${REMOTE_VER}"; then
+        echo -e "${GREEN}========================================${NC}"
+        echo -e "${GREEN}[√] 当前版本比远程最新版本更新，已跳过更新${NC}"
+        echo -e "${GREEN}当前版本: ${CURRENT_VER}${NC}"
+        echo -e "${GREEN}远程最新版本: ${REMOTE_VER}（${REMOTE_CHANNEL}）${NC}"
+        echo -e "${GREEN}========================================${NC}"
+        warn "如确需降级，请手动安装目标版本"
+        exit 0
+    fi
+
+    info "发现新版本，将从 ${CURRENT_VER} 更新到 ${REMOTE_VER}（${REMOTE_CHANNEL}）"
 }
 
 # 4. 下载与验证
